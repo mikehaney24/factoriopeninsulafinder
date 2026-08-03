@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM --platform=linux/amd64 debian:bookworm-slim
 
 # Install wget and xz-utils to download and extract the Factorio headless binary
 RUN apt-get update && apt-get install -y \

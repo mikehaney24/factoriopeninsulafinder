@@ -10,7 +10,9 @@
 import argparse
 import concurrent.futures
 import os
+import queue
 import subprocess
+import tempfile
 import threading
 import sys
 from collections import deque
@@ -90,18 +92,18 @@ def analyze_perimeter_peninsula(image_path):
     visited = bytearray(width * height)
     visited[cy * width + cx] = 1
     
-    queue = deque([(cx, cy)])
+    queue_pixels = deque([(cx, cy)])
     directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
     
-    while queue:
-        px, py = queue.popleft()
+    while queue_pixels:
+        px, py = queue_pixels.popleft()
         for dx, dy in directions:
             nx, ny = px + dx, py + dy
             if 0 <= nx < width and 0 <= ny < height:
                 idx = ny * width + nx
                 if not visited[idx] and not is_water(nx, ny):
                     visited[idx] = 1
-                    queue.append((nx, ny))
+                    queue_pixels.append((nx, ny))
 
     perimeter_pixels = []
     for x in range(width): perimeter_pixels.append((x, 0))
@@ -151,35 +153,37 @@ def analyze_perimeter_peninsula(image_path):
 def get_timestamp():
     return f"[{datetime.now().strftime('%H:%M:%S')}]"
 
-def process_seed(seed, args, seed_log_path, log_lock, procs_lock, active_procs, matches, shutdown_event):
+def process_seed(seed, args, seed_log_path, log_lock, procs_lock, active_procs, matches, shutdown_event, worker_configs_queue):
     if shutdown_event.is_set():
         return
         
     temp_file = os.path.join(args.out_dir, f"temp_preview_{seed}.png")
     debug_file = os.path.join(args.out_dir, f"DEBUG_seed_{seed}.png")
     
-    cmd = [
-        args.factorio_bin,
-        "--generate-map-preview", temp_file,
-        "--map-gen-seed", str(seed),
-        "--map-preview-size", str(args.size),
-        "--preset", args.preset
-    ]
-    if args.map_gen_settings:
-        cmd.extend(["--map-gen-settings", args.map_gen_settings])
-    if args.map_settings:
-        cmd.extend(["--map-settings", args.map_settings])
-    
+    config_path = worker_configs_queue.get()
     proc = None
     try:
         if shutdown_event.is_set():
             return
             
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd = [
+            args.factorio_bin,
+            "-c", config_path,
+            "--generate-map-preview", temp_file,
+            "--map-gen-seed", str(seed),
+            "--map-preview-size", str(args.size),
+            "--preset", args.preset
+        ]
+        if args.map_gen_settings:
+            cmd.extend(["--map-gen-settings", args.map_gen_settings])
+        if args.map_settings:
+            cmd.extend(["--map-settings", args.map_settings])
+            
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         with procs_lock:
             active_procs.add(proc)
             
-        proc.wait()
+        _, stderr_out = proc.communicate()
         
         with procs_lock:
             active_procs.discard(proc)
@@ -188,7 +192,9 @@ def process_seed(seed, args, seed_log_path, log_lock, procs_lock, active_procs, 
             return
             
         if proc.returncode != 0:
-            tqdm.write(f"{get_timestamp()} Warning: Factorio exited with code {proc.returncode} for seed {seed}", file=sys.stdout)
+            err_line = stderr_out.strip().splitlines()[-1] if stderr_out and stderr_out.strip() else ""
+            err_suffix = f": {err_line}" if err_line else ""
+            tqdm.write(f"{get_timestamp()} Warning: Factorio exited with code {proc.returncode} for seed {seed}{err_suffix}", file=sys.stdout)
             return
             
         if not os.path.exists(temp_file):
@@ -247,6 +253,7 @@ def process_seed(seed, args, seed_log_path, log_lock, procs_lock, active_procs, 
         if not shutdown_event.is_set():
             tqdm.write(f"{get_timestamp()} Error analyzing seed {seed}: {e}", file=sys.stdout)
     finally:
+        worker_configs_queue.put(config_path)
         with procs_lock:
             if proc:
                 active_procs.discard(proc)
@@ -303,44 +310,55 @@ def main():
     refresher_thread.daemon = True
     refresher_thread.start()
 
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = {
-                executor.submit(
-                    process_seed,
-                    args.start_seed + i,
-                    args,
-                    seed_log_path,
-                    log_lock,
-                    procs_lock,
-                    active_procs,
-                    matches,
-                    shutdown_event
-                ): (args.start_seed + i)
-                for i in range(args.count)
-            }
-            
-            for future in concurrent.futures.as_completed(futures):
-                if shutdown_event.is_set():
-                    break
-                pbar.update(1)
-                
-    except KeyboardInterrupt:
-        shutdown_event.set()
-        tqdm.write(f"\n{get_timestamp()} Scan interrupted by user. Terminating active workers...", file=sys.stdout)
-        with procs_lock:
-            for p in list(active_procs):
-                try:
-                    p.kill()
-                except OSError:
-                    pass
-        sys.exit(0)
+    with tempfile.TemporaryDirectory(prefix="factorio_workers_") as temp_base_dir:
+        worker_configs_queue = queue.Queue()
+        for i in range(args.workers):
+            w_dir = os.path.join(temp_base_dir, f"worker_{i}")
+            os.makedirs(w_dir, exist_ok=True)
+            cfg_path = os.path.join(w_dir, "config.ini")
+            with open(cfg_path, "w") as f:
+                f.write(f"[path]\nread-data=__PATH__executable__/../../data\nwrite-data={w_dir}\n")
+            worker_configs_queue.put(cfg_path)
 
-    finally:
-        stop_refresh.set()
-        if refresher_thread.is_alive():
-            refresher_thread.join()
-        pbar.close()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(
+                        process_seed,
+                        args.start_seed + i,
+                        args,
+                        seed_log_path,
+                        log_lock,
+                        procs_lock,
+                        active_procs,
+                        matches,
+                        shutdown_event,
+                        worker_configs_queue
+                    ): (args.start_seed + i)
+                    for i in range(args.count)
+                }
+                
+                for future in concurrent.futures.as_completed(futures):
+                    if shutdown_event.is_set():
+                        break
+                    pbar.update(1)
+                    
+        except KeyboardInterrupt:
+            shutdown_event.set()
+            tqdm.write(f"\n{get_timestamp()} Scan interrupted by user. Terminating active workers...", file=sys.stdout)
+            with procs_lock:
+                for p in list(active_procs):
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+            sys.exit(0)
+
+        finally:
+            stop_refresh.set()
+            if refresher_thread.is_alive():
+                refresher_thread.join()
+            pbar.close()
 
     print(f"\n{get_timestamp()} Scan complete. Found {len(matches)} matching seeds.")
 
