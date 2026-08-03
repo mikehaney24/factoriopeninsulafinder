@@ -87,7 +87,7 @@ uv run find_peninsula.py \
 | `--preset` | `str` | `default` | Map gen preset (`default`, `rail-world`, `death-world`, `rich-resources`, etc.). |
 | `--out-dir` | `str` | `./seed_previews` | Directory to save match preview images and logs. |
 | `--out-file` | `str` | `found_seeds.txt` | Text filename where found seeds are appended. |
-| `--debug` | `flag` | `False` | Save visual overlay images showing spawn BFS and free border arcs. |
+| `--debug` | `flag` | `False` | Generate and save debug overlay images for all scanned seeds (saved seeds always generate debug images). |
 | `--map-gen-settings` | `str` | `None` | Path to a custom `map-gen-settings.json` file. |
 | `--map-settings` | `str` | `None` | Path to a custom `map-settings.json` file. |
 | `--factorio-bin` | `str` | `factorio` | Path to the Factorio executable. |
@@ -96,15 +96,21 @@ uv run find_peninsula.py \
 
 ## 📁 Output Structure
 
-When a matching seed is discovered, it is saved in `./seed_previews/`:
+When a matching seed is discovered, both the clean map preview and the annotated debug visualization overlay are saved in `./seed_previews/`:
 
 ```
 seed_previews/
-├── found_seeds.txt                       # Appended list of all discovered seeds and match types
-├── ISLAND_seed_10101035.png              # 100% water-isolated starting island
-├── POSSIBLE_ISLAND_seed_10101092_98pct.png # 98% isolated choke point
-└── PENINSULA_seed_10101047_68pct.png     # 68% water perimeter peninsula
+├── found_seeds.txt                         # Appended list of all discovered seeds and match types
+├── ISLAND_seed_10101035.png                # Clean Factorio map preview
+├── DEBUG_seed_10101035.png                 # Visual overlay showing landmass & perimeter arc
+├── PENINSULA_seed_10101047_68pct.png       # 68% water perimeter peninsula
+└── DEBUG_seed_10101047.png                 # Annotated overlay
 ```
+
+### Visual Overlay Annotations:
+- **Green Tint**: The flood-filled connected spawn landmass.
+- **Blue Markers**: The longest detected contiguous perimeter arc free of spawn land.
+- **Red Dot**: Spawn point origin `(0, 0)`.
 
 ### Example `found_seeds.txt`
 ```
@@ -117,10 +123,8 @@ seed_previews/
 
 ## 🛠️ Debug Mode (`--debug`)
 
-When running with `--debug`, an annotated image (`DEBUG_seed_<seed>.png`) is saved for every evaluated seed:
-- **Green Tint**: The flood-filled connected spawn landmass.
-- **Blue Markers**: The longest detected contiguous perimeter arc free of spawn land.
-- **Red Dot**: Spawn point origin `(0, 0)`.
+- **Default behavior**: Annotated overlay images (`DEBUG_seed_<seed>.png`) are generated automatically for all **saved / matched** seeds. Non-matching seeds are discarded to save disk space and maximize throughput.
+- **`--debug` flag**: When `--debug` is enabled, annotated images are generated for **all** scanned seeds (including non-matches).
 
 ---
 

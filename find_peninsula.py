@@ -43,7 +43,7 @@ tqdm_std.format_interval = custom_format_interval
 tqdm_utils.format_interval = custom_format_interval
 # =========================================================
 
-def analyze_perimeter_peninsula(image_path, debug_path=None):
+def analyze_perimeter_peninsula(image_path):
     img = Image.open(image_path).convert("RGB")
     width, height = img.size
     pixels = img.load()
@@ -73,17 +73,18 @@ def analyze_perimeter_peninsula(image_path, debug_path=None):
                 break
 
     if not start_found:
-        return 1.0
+        def save_empty_debug(debug_path):
+            annotated_img = img.copy()
+            draw = ImageDraw.Draw(annotated_img)
+            draw.ellipse([(cx-5, cy-5), (cx+5, cy+5)], fill=(255, 0, 0))
+            annotated_img.save(debug_path)
+        return 1.0, save_empty_debug
 
     visited = bytearray(width * height)
     visited[cy * width + cx] = 1
     
     queue = deque([(cx, cy)])
     directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    
-    spawn_land_list = []
-    if debug_path:
-        spawn_land_list.append((cx, cy))
     
     while queue:
         px, py = queue.popleft()
@@ -94,8 +95,6 @@ def analyze_perimeter_peninsula(image_path, debug_path=None):
                 if not visited[idx] and not is_water(nx, ny):
                     visited[idx] = 1
                     queue.append((nx, ny))
-                    if debug_path:
-                        spawn_land_list.append((nx, ny))
 
     perimeter_pixels = []
     for x in range(width): perimeter_pixels.append((x, 0))
@@ -118,15 +117,18 @@ def analyze_perimeter_peninsula(image_path, debug_path=None):
     max_arc = min(max_arc, len(perimeter_pixels))
     free_border_ratio = max_arc / len(perimeter_pixels)
 
-    if debug_path:
+    def save_debug_image(debug_path):
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 150))
         overlay_pixels = overlay.load()
         
-        for px, py in spawn_land_list:
-            overlay_pixels[px, py] = (0, 255, 0, 150)
-            
-        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-        draw = ImageDraw.Draw(img)
+        for y in range(height):
+            row_idx = y * width
+            for x in range(width):
+                if visited[row_idx + x]:
+                    overlay_pixels[x, y] = (0, 255, 0, 150)
+                    
+        annotated_img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(annotated_img)
         
         arc_start_idx = "".join(['1' if b else '0' for b in doubled_border]).find('1' * max_arc)
         if arc_start_idx != -1:
@@ -135,9 +137,9 @@ def analyze_perimeter_peninsula(image_path, debug_path=None):
                 draw.rectangle([px-2, py-2, px+2, py+2], fill=(0, 100, 255))
                 
         draw.ellipse([(cx-5, cy-5), (cx+5, cy+5)], fill=(255, 0, 0))
-        img.save(debug_path)
+        annotated_img.save(debug_path)
 
-    return free_border_ratio
+    return free_border_ratio, save_debug_image
 
 def get_timestamp():
     return f"[{datetime.now().strftime('%H:%M:%S')}]"
@@ -154,7 +156,7 @@ def main():
     parser.add_argument("--preset", default="default", help="Map generation preset (e.g. default, rail-world, death-world)")
     parser.add_argument("--map-gen-settings", default=None, help="Optional path to map-gen-settings.json")
     parser.add_argument("--map-settings", default=None, help="Optional path to map-settings.json")
-    parser.add_argument("--debug", action="store_true", help="Generate and save debug visualization overlays for scanned seeds")
+    parser.add_argument("--debug", action="store_true", help="Generate and save debug visualization overlays for all scanned seeds")
     
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -186,7 +188,7 @@ def main():
         for i in range(args.count):
             seed = args.start_seed + i
             temp_file = os.path.join(args.out_dir, f"temp_preview_{seed}.png")
-            debug_file = os.path.join(args.out_dir, f"DEBUG_seed_{seed}.png") if args.debug else None
+            debug_file = os.path.join(args.out_dir, f"DEBUG_seed_{seed}.png")
             
             cmd = [
                 args.factorio_bin,
@@ -208,13 +210,15 @@ def main():
                     tqdm.write(f"{get_timestamp()} Warning: Factorio exited with code {proc.returncode} for seed {seed}", file=sys.stdout)
                     continue
                     
-                free_border_ratio = analyze_perimeter_peninsula(temp_file, debug_file)
+                free_border_ratio, save_debug_func = analyze_perimeter_peninsula(temp_file)
                 match_found = False
                 log_entry = ""
                 
                 if free_border_ratio == 1.0:
                     match_filename = os.path.join(args.out_dir, f"ISLAND_seed_{seed}.png")
                     os.rename(temp_file, match_filename)
+                    if save_debug_func:
+                        save_debug_func(debug_file)
                     tqdm.write(f"{get_timestamp()} [ ISLAND ] Seed {seed}: 100% free border! True island detected -> Saved", file=sys.stdout)
                     matches.append(seed)
                     match_found = True
@@ -223,6 +227,8 @@ def main():
                 elif 0.95 <= free_border_ratio < 1.0:
                     match_filename = os.path.join(args.out_dir, f"POSSIBLE_ISLAND_seed_{seed}_{int(free_border_ratio*100)}pct.png")
                     os.rename(temp_file, match_filename)
+                    if save_debug_func:
+                        save_debug_func(debug_file)
                     tqdm.write(f"{get_timestamp()} [ POSSIBLE ISLAND ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved", file=sys.stdout)
                     matches.append(seed)
                     match_found = True
@@ -231,12 +237,16 @@ def main():
                 elif free_border_ratio >= args.min_ratio:
                     match_filename = os.path.join(args.out_dir, f"PENINSULA_seed_{seed}_{int(free_border_ratio*100)}pct.png")
                     os.rename(temp_file, match_filename)
+                    if save_debug_func:
+                        save_debug_func(debug_file)
                     tqdm.write(f"{get_timestamp()} [ MATCH ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved", file=sys.stdout)
                     matches.append(seed)
                     match_found = True
                     log_entry = f"{seed} - PENINSULA ({free_border_ratio:.1%} free border)\n"
                     
                 else:
+                    if args.debug and save_debug_func:
+                        save_debug_func(debug_file)
                     if os.path.exists(temp_file):
                         os.remove(temp_file)
                     
