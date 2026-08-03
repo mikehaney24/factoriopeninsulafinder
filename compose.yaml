@@ -1,0 +1,14 @@
+services:
+  seed-finder:
+    build: .
+    platform: linux/amd64 
+    tty: true
+    stdin_open: true
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TERM=xterm-256color
+    volumes:
+      - ./seed_previews:/app/seed_previews
+      - ./find_peninsula.py:/app/find_peninsula.py
+    # Add --size 2048 (or 4096) to the end of the command
+    command: ["--start-seed", "20271569", "--count", "1000", "--size", "2048"]
