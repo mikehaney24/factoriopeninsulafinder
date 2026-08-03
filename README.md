@@ -82,6 +82,7 @@ uv run find_peninsula.py \
 | :--- | :--- | :--- | :--- |
 | `--start-seed` | `int` | `1000` | Starting world seed number to scan. |
 | `--count` | `int` | `100` | Total number of sequential seeds to test. |
+| `-j`, `--workers` | `int` | *All logical cores* | Number of parallel worker threads / concurrent Factorio instances. |
 | `--size` | `int` | `1024` | Resolution (width and height in px) of generated map previews. |
 | `--min-ratio` | `float` | `0.50` | Minimum free border ratio (`0.0` to `1.0`) to consider a peninsula. |
 | `--preset` | `str` | `default` | Map gen preset (`default`, `rail-world`, `death-world`, `rich-resources`, etc.). |

@@ -8,6 +8,7 @@
 # ///
 
 import argparse
+import concurrent.futures
 import os
 import subprocess
 import threading
@@ -21,13 +22,12 @@ import tqdm.std as tqdm_std
 import tqdm.utils as tqdm_utils
 
 # =========================================================
-# 1. Prevent the Semaphore Leak
+# 1. Prevent the Semaphore Leak & Ensure Thread-Safe Locking
 # =========================================================
 tqdm.set_lock(threading.RLock())
 
 # =========================================================
 # 2. Force Custom Time Formatting (e.g., 5h3m10s)
-# Patching both modules guarantees tqdm uses it.
 # =========================================================
 def custom_format_interval(t):
     t = int(t)
@@ -42,6 +42,13 @@ def custom_format_interval(t):
 tqdm_std.format_interval = custom_format_interval
 tqdm_utils.format_interval = custom_format_interval
 # =========================================================
+
+def get_cpu_count():
+    """Returns available logical CPU cores/hyperthreads, respecting container affinity if set."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, NotImplementedError, OSError):
+        return os.cpu_count() or 4
 
 def analyze_perimeter_peninsula(image_path):
     img = Image.open(image_path).convert("RGB")
@@ -144,11 +151,119 @@ def analyze_perimeter_peninsula(image_path):
 def get_timestamp():
     return f"[{datetime.now().strftime('%H:%M:%S')}]"
 
+def process_seed(seed, args, seed_log_path, log_lock, procs_lock, active_procs, matches, shutdown_event):
+    if shutdown_event.is_set():
+        return
+        
+    temp_file = os.path.join(args.out_dir, f"temp_preview_{seed}.png")
+    debug_file = os.path.join(args.out_dir, f"DEBUG_seed_{seed}.png")
+    
+    cmd = [
+        args.factorio_bin,
+        "--generate-map-preview", temp_file,
+        "--map-gen-seed", str(seed),
+        "--map-preview-size", str(args.size),
+        "--preset", args.preset
+    ]
+    if args.map_gen_settings:
+        cmd.extend(["--map-gen-settings", args.map_gen_settings])
+    if args.map_settings:
+        cmd.extend(["--map-settings", args.map_settings])
+    
+    proc = None
+    try:
+        if shutdown_event.is_set():
+            return
+            
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with procs_lock:
+            active_procs.add(proc)
+            
+        proc.wait()
+        
+        with procs_lock:
+            active_procs.discard(proc)
+            
+        if shutdown_event.is_set():
+            return
+            
+        if proc.returncode != 0:
+            tqdm.write(f"{get_timestamp()} Warning: Factorio exited with code {proc.returncode} for seed {seed}", file=sys.stdout)
+            return
+            
+        if not os.path.exists(temp_file):
+            return
+
+        free_border_ratio, save_debug_func = analyze_perimeter_peninsula(temp_file)
+        match_found = False
+        log_entry = ""
+        
+        if free_border_ratio == 1.0:
+            match_filename = os.path.join(args.out_dir, f"ISLAND_seed_{seed}.png")
+            if os.path.exists(match_filename):
+                os.remove(match_filename)
+            os.rename(temp_file, match_filename)
+            if save_debug_func:
+                save_debug_func(debug_file)
+            tqdm.write(f"{get_timestamp()} [ ISLAND ] Seed {seed}: 100% free border! True island detected -> Saved", file=sys.stdout)
+            match_found = True
+            log_entry = f"{seed} - ISLAND (100% free border)\n"
+            
+        elif 0.95 <= free_border_ratio < 1.0:
+            match_filename = os.path.join(args.out_dir, f"POSSIBLE_ISLAND_seed_{seed}_{int(free_border_ratio*100)}pct.png")
+            if os.path.exists(match_filename):
+                os.remove(match_filename)
+            os.rename(temp_file, match_filename)
+            if save_debug_func:
+                save_debug_func(debug_file)
+            tqdm.write(f"{get_timestamp()} [ POSSIBLE ISLAND ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved", file=sys.stdout)
+            match_found = True
+            log_entry = f"{seed} - POSSIBLE ISLAND ({free_border_ratio:.1%} free border)\n"
+            
+        elif free_border_ratio >= args.min_ratio:
+            match_filename = os.path.join(args.out_dir, f"PENINSULA_seed_{seed}_{int(free_border_ratio*100)}pct.png")
+            if os.path.exists(match_filename):
+                os.remove(match_filename)
+            os.rename(temp_file, match_filename)
+            if save_debug_func:
+                save_debug_func(debug_file)
+            tqdm.write(f"{get_timestamp()} [ MATCH ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved", file=sys.stdout)
+            match_found = True
+            log_entry = f"{seed} - PENINSULA ({free_border_ratio:.1%} free border)\n"
+            
+        else:
+            if args.debug and save_debug_func:
+                save_debug_func(debug_file)
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            
+        if match_found:
+            with log_lock:
+                matches.append(seed)
+                with open(seed_log_path, "a") as f:
+                    f.write(log_entry)
+            
+    except Exception as e:
+        if not shutdown_event.is_set():
+            tqdm.write(f"{get_timestamp()} Error analyzing seed {seed}: {e}", file=sys.stdout)
+    finally:
+        with procs_lock:
+            if proc:
+                active_procs.discard(proc)
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
+
 def main():
-    parser = argparse.ArgumentParser(description="Factorio Peninsula & Island Finder")
+    detected_cpus = get_cpu_count()
+    parser = argparse.ArgumentParser(description="Factorio Peninsula & Island Finder (Multi-Core)")
     parser.add_argument("--factorio-bin", default="factorio", help="Path to Factorio executable")
     parser.add_argument("--start-seed", type=int, default=1000, help="Starting seed number")
     parser.add_argument("--count", type=int, default=100, help="Number of seeds to scan")
+    parser.add_argument("-j", "--workers", type=int, default=detected_cpus,
+                        help=f"Number of parallel worker threads (default: {detected_cpus}, all available logical CPU cores/hyperthreads)")
     parser.add_argument("--out-dir", default="./seed_previews", help="Directory to save matches")
     parser.add_argument("--out-file", default="found_seeds.txt", help="Filename to append found seeds")
     parser.add_argument("--size", type=int, default=1024, help="Image resolution (px)")
@@ -163,11 +278,15 @@ def main():
     
     seed_log_path = os.path.join(args.out_dir, args.out_file)
     
-    print(f"{get_timestamp()} Scanning {args.count} seeds starting from {args.start_seed}...\n")
+    print(f"{get_timestamp()} Scanning {args.count} seeds starting from {args.start_seed} using {args.workers} parallel workers...\n")
     
     matches = []
+    log_lock = threading.Lock()
+    procs_lock = threading.Lock()
+    active_procs = set()
+    shutdown_event = threading.Event()
     
-    # This renders "Factorio" statically, and expands the '.' and 'o' dynamically
+    # Progress bar with dynamic time display
     pbar = tqdm(
         total=args.count, 
         ascii=".o", 
@@ -185,92 +304,36 @@ def main():
     refresher_thread.start()
 
     try:
-        for i in range(args.count):
-            seed = args.start_seed + i
-            temp_file = os.path.join(args.out_dir, f"temp_preview_{seed}.png")
-            debug_file = os.path.join(args.out_dir, f"DEBUG_seed_{seed}.png")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(
+                    process_seed,
+                    args.start_seed + i,
+                    args,
+                    seed_log_path,
+                    log_lock,
+                    procs_lock,
+                    active_procs,
+                    matches,
+                    shutdown_event
+                ): (args.start_seed + i)
+                for i in range(args.count)
+            }
             
-            cmd = [
-                args.factorio_bin,
-                "--generate-map-preview", temp_file,
-                "--map-gen-seed", str(seed),
-                "--map-preview-size", str(args.size),
-                "--preset", args.preset
-            ]
-            if args.map_gen_settings:
-                cmd.extend(["--map-gen-settings", args.map_gen_settings])
-            if args.map_settings:
-                cmd.extend(["--map-settings", args.map_settings])
-            
-            proc = None
-            try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                proc.wait()
-                if proc.returncode != 0:
-                    tqdm.write(f"{get_timestamp()} Warning: Factorio exited with code {proc.returncode} for seed {seed}", file=sys.stdout)
-                    continue
-                    
-                free_border_ratio, save_debug_func = analyze_perimeter_peninsula(temp_file)
-                match_found = False
-                log_entry = ""
-                
-                if free_border_ratio == 1.0:
-                    match_filename = os.path.join(args.out_dir, f"ISLAND_seed_{seed}.png")
-                    os.rename(temp_file, match_filename)
-                    if save_debug_func:
-                        save_debug_func(debug_file)
-                    tqdm.write(f"{get_timestamp()} [ ISLAND ] Seed {seed}: 100% free border! True island detected -> Saved", file=sys.stdout)
-                    matches.append(seed)
-                    match_found = True
-                    log_entry = f"{seed} - ISLAND (100% free border)\n"
-                    
-                elif 0.95 <= free_border_ratio < 1.0:
-                    match_filename = os.path.join(args.out_dir, f"POSSIBLE_ISLAND_seed_{seed}_{int(free_border_ratio*100)}pct.png")
-                    os.rename(temp_file, match_filename)
-                    if save_debug_func:
-                        save_debug_func(debug_file)
-                    tqdm.write(f"{get_timestamp()} [ POSSIBLE ISLAND ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved", file=sys.stdout)
-                    matches.append(seed)
-                    match_found = True
-                    log_entry = f"{seed} - POSSIBLE ISLAND ({free_border_ratio:.1%} free border)\n"
-                    
-                elif free_border_ratio >= args.min_ratio:
-                    match_filename = os.path.join(args.out_dir, f"PENINSULA_seed_{seed}_{int(free_border_ratio*100)}pct.png")
-                    os.rename(temp_file, match_filename)
-                    if save_debug_func:
-                        save_debug_func(debug_file)
-                    tqdm.write(f"{get_timestamp()} [ MATCH ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved", file=sys.stdout)
-                    matches.append(seed)
-                    match_found = True
-                    log_entry = f"{seed} - PENINSULA ({free_border_ratio:.1%} free border)\n"
-                    
-                else:
-                    if args.debug and save_debug_func:
-                        save_debug_func(debug_file)
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
-                    
-                if match_found:
-                    with open(seed_log_path, "a") as f:
-                        f.write(log_entry)
-                    
-            except KeyboardInterrupt:
-                if proc and proc.poll() is None:
-                    proc.terminate()
-                    proc.wait()
-                raise
-            except Exception as e:
-                tqdm.write(f"{get_timestamp()} Error analyzing seed {seed}: {e}", file=sys.stdout)
-            finally:
-                if os.path.exists(temp_file):
-                    try:
-                        os.remove(temp_file)
-                    except OSError:
-                        pass
+            for future in concurrent.futures.as_completed(futures):
+                if shutdown_event.is_set():
+                    break
                 pbar.update(1)
-
+                
     except KeyboardInterrupt:
-        tqdm.write(f"\n{get_timestamp()} Scan interrupted by user. Shutting down gracefully...", file=sys.stdout)
+        shutdown_event.set()
+        tqdm.write(f"\n{get_timestamp()} Scan interrupted by user. Terminating active workers...", file=sys.stdout)
+        with procs_lock:
+            for p in list(active_procs):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
         sys.exit(0)
 
     finally:
@@ -279,7 +342,7 @@ def main():
             refresher_thread.join()
         pbar.close()
 
-    print(f"\n{get_timestamp()} Scan complete! Found {len(matches)} potential seeds. Logged to {seed_log_path}")
+    print(f"\n{get_timestamp()} Scan complete. Found {len(matches)} matching seeds.")
 
 if __name__ == "__main__":
     main()
