@@ -1,6 +1,17 @@
 # Factorio Peninsula & Island Finder 🏝️⚙️
 
-An automated scanner for Factorio map seeds that identifies defensible **peninsulas**, **choke points**, and **isolated islands** around the player spawn.
+An automated, high-performance scanner for Factorio map seeds that identifies defensible **peninsulas**, **choke points**, and **isolated islands** around the player spawn.
+
+---
+
+## ⚡ Key Features
+
+- **Multi-Core & Hyperthreading Parallelization**: Automatically detects and leverages all physical CPU cores and logical hyperthreads (e.g., 8, 16, 32 threads) for concurrent seed generation and maximum throughput.
+- **Headless Generation**: Spawns concurrent Factorio instances headlessly to render map previews around spawn `(0, 0)`.
+- **Intelligent Geography Classification**: Analyzes pixel channel data and runs a BFS flood fill to trace the connected starting landmass.
+- **Defensible Choke-Point Detection**: Measures the longest circular perimeter arc free of spawn land to detect natural defensive choke points.
+- **Automatic Visual Overlays**: Saves both the clean Factorio map preview and an annotated overlay (`DEBUG_seed_<seed>.png`) for all matching seeds.
+- **Instant Docker Deployment**: Pre-built container with embedded headless Factorio engine and pre-warmed dependencies.
 
 ---
 
@@ -29,9 +40,10 @@ The container is designed as a **composable CLI tool**: it packages the official
    docker compose up --build
    ```
 
-2. **Run a custom scan on-demand**:
+2. **Run a custom scan on-demand with custom workers**:
    ```bash
-   docker compose run --rm seed-finder --start-seed 500000 --count 200 --size 1024
+   # Automatically uses all available CPU threads (or override with -j <threads>)
+   docker compose run --rm seed-finder --start-seed 500000 --count 1000 --size 1024 -j 16
    ```
 
 3. **Check results**: Found seeds and preview images are saved locally to `./seed_previews/`.
@@ -45,16 +57,17 @@ The container is designed as a **composable CLI tool**: it packages the official
    docker build -t factorio-peninsula-finder .
    ```
 
-2. **Run the container**:
+2. **Run the container (uses all CPU cores/threads by default)**:
    ```bash
    docker run --rm -it \
      --platform linux/amd64 \
      -v "$(pwd)/seed_previews:/app/seed_previews" \
      factorio-peninsula-finder \
      --start-seed 1000000 \
-     --count 500 \
+     --count 1000 \
      --size 2048 \
-     --preset default
+     --preset default \
+     -j 16
    ```
 
 > **Note for Apple Silicon (macOS) users**: The Factorio headless binary is `linux/amd64`. Docker Desktop automatically handles emulation via `--platform linux/amd64` (already configured in `compose.yaml`).
@@ -70,8 +83,9 @@ If you have Factorio installed locally and [`uv`](https://docs.astral.sh/uv/) or
 uv run find_peninsula.py \
   --factorio-bin "/path/to/factorio" \
   --start-seed 1000 \
-  --count 100 \
-  --size 1024
+  --count 500 \
+  --size 1024 \
+  -j 8
 ```
 
 ---
@@ -82,7 +96,7 @@ uv run find_peninsula.py \
 | :--- | :--- | :--- | :--- |
 | `--start-seed` | `int` | `1000` | Starting world seed number to scan. |
 | `--count` | `int` | `100` | Total number of sequential seeds to test. |
-| `-j`, `--workers` | `int` | *All logical cores* | Number of parallel worker threads / concurrent Factorio instances. |
+| `-j`, `--workers` | `int` | *All logical cores* | Number of parallel worker threads / concurrent Factorio instances (takes full advantage of multi-core & hyperthreading). |
 | `--size` | `int` | `1024` | Resolution (width and height in px) of generated map previews. |
 | `--min-ratio` | `float` | `0.50` | Minimum free border ratio (`0.0` to `1.0`) to consider a peninsula. |
 | `--preset` | `str` | `default` | Map gen preset (`default`, `rail-world`, `death-world`, `rich-resources`, etc.). |
