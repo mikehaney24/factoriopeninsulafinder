@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pil \
     python3-tqdm \
+    python3-numpy \
+    python3-scipy \
     && rm -rf /var/lib/apt/lists/*
 
 # Download and extract the Factorio headless server

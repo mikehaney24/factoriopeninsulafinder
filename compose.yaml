@@ -10,5 +10,9 @@ services:
     volumes:
       - ./seed_previews:/app/seed_previews
       - ./find_peninsula.py:/app/find_peninsula.py
+    # Previews being analyzed are written here and discarded unless they match.
+    # Keeping them off the bind mount avoids a round-trip through the host FS.
+    tmpfs:
+      - /tmp
     # Add --size 2048 (or 4096) to the end of the command
     command: ["--start-seed", "20271569", "--count", "1000", "--size", "2048"]
