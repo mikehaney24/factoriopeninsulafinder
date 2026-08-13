@@ -198,6 +198,9 @@ So `--island-prescan` **requires `--min-ratio >= 0.95`** and errors out otherwis
 | `--prescan-max-clear` | `int` | `0` | Keep seeds with at most this many clear rays. `0` is exact for true islands; raise to admit near-islands at higher cost. |
 | `--prescan-slice` | `int` | `50000` | Seeds screened per pass. Bounds work lost to an interrupt. |
 | `--prescan-port-base` | `int` | `34197` | First UDP port; one per prescan worker. |
+| `--keep-candidates` | `flag` | `False` | Keep every candidate's rendered preview under `candidates/`, not just matches. |
+
+Candidate seeds and their clear-ray counts are **always** appended to `island_candidates.txt`, since re-screening to recover that list costs as much as the original scan. Add `--keep-candidates` to also retain the previews themselves — useful for eyeballing near-misses, at roughly 1.3 MB per candidate at `--size 2048`.
 
 ---
 
