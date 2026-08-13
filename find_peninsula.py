@@ -18,6 +18,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 import sys
 from datetime import datetime
 
@@ -56,6 +57,9 @@ tqdm_utils.format_interval = custom_format_interval
 SEED_STRIDE = 2
 
 PROGRESS_FILENAME = "scan_progress.txt"
+
+# How often a running batch is scanned for newly-finished previews.
+PREVIEW_POLL_SECONDS = 0.25
 
 
 def get_cpu_count():
@@ -236,15 +240,49 @@ def classify(seed, preview_path, out_dir, min_ratio, debug):
     return seed, free_border_ratio, log_entry, message
 
 
+def png_is_complete(path):
+    """True once the file ends with a PNG IEND chunk, i.e. Factorio has finished it.
+
+    Previews are picked up while the engine is still writing the rest of the
+    batch, so a half-written file must never be handed to the analyzer.
+    """
+    try:
+        with open(path, "rb") as f:
+            if f.seek(0, os.SEEK_END) < 12:
+                return False
+            # Final chunk is 4-byte length, b"IEND", 4-byte CRC.
+            f.seek(-8, os.SEEK_END)
+            return f.read(8)[:4] == b"IEND"
+    except OSError:
+        return False
+
+
 def generate_previews(seed_start, seed_end, batch_dir, args, config_path,
                       procs_lock, active_procs, shutdown_event):
-    """Render every seed in [seed_start, seed_end] into batch_dir as <seed>.png.
+    """Yield (seed, path) for each preview as Factorio finishes writing it.
 
     One Factorio process per parity: --map-gen-seed-max walks the interval in
     steps of SEED_STRIDE, so a contiguous range needs SEED_STRIDE passes. Each
     process pays the ~1s prototype-load cost once for the whole batch.
+
+    Previews are yielded during generation rather than after the process exits,
+    so analysis overlaps rendering and the progress bar advances continuously.
     """
     os.makedirs(batch_dir, exist_ok=True)
+    seen = set()
+
+    def harvest():
+        for name in os.listdir(batch_dir):
+            if name in seen or not name.endswith(".png"):
+                continue
+            path = os.path.join(batch_dir, name)
+            if not png_is_complete(path):
+                continue
+            seen.add(name)
+            try:
+                yield int(name[:-4]), path
+            except ValueError:
+                continue
 
     for offset in range(SEED_STRIDE):
         if shutdown_event.is_set():
@@ -268,17 +306,35 @@ def generate_previews(seed_start, seed_end, batch_dir, args, config_path,
         if args.map_settings:
             cmd.extend(["--map-settings", args.map_settings])
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        with procs_lock:
-            active_procs.add(proc)
-        try:
-            _, stderr_out = proc.communicate()
-        finally:
+        # stderr goes to a file rather than a pipe: nothing drains a pipe while
+        # we poll, and a full pipe buffer would deadlock the engine.
+        err_path = os.path.join(batch_dir, f"stderr_{offset}.log")
+        with open(err_path, "w+") as err_file:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err_file, text=True)
             with procs_lock:
-                active_procs.discard(proc)
+                active_procs.add(proc)
+            try:
+                while proc.poll() is None:
+                    yield from harvest()
+                    if shutdown_event.is_set():
+                        return
+                    time.sleep(PREVIEW_POLL_SECONDS)
+            finally:
+                with procs_lock:
+                    active_procs.discard(proc)
 
-        if shutdown_event.is_set():
-            return
+            yield from harvest()
+
+            if shutdown_event.is_set():
+                return
+
+            err_file.seek(0)
+            stderr_out = err_file.read()
+
+        try:
+            os.remove(err_path)
+        except OSError:
+            pass
 
         if proc.returncode != 0:
             err_line = stderr_out.strip().splitlines()[-1] if stderr_out and stderr_out.strip() else ""
@@ -293,36 +349,22 @@ def generate_previews(seed_start, seed_end, batch_dir, args, config_path,
 def process_batch(seed_start, seed_end, args, temp_base_dir, analysis_pool,
                   seed_log_path, log_lock, procs_lock, active_procs, matches,
                   shutdown_event, worker_configs_queue, progress_path, pbar, pbar_lock):
-    """Generate one batch of previews, then fan the analysis out across processes."""
+    """Analyze one batch of previews as Factorio renders them."""
     if shutdown_event.is_set():
         return
 
     batch_dir = os.path.join(temp_base_dir, f"batch_{seed_start}")
-    config_path = worker_configs_queue.get()
-    try:
-        generate_previews(seed_start, seed_end, batch_dir, args, config_path,
-                          procs_lock, active_procs, shutdown_event)
-    finally:
-        worker_configs_queue.put(config_path)
 
-    if shutdown_event.is_set():
-        return
+    def harvest(futures, block):
+        """Handle finished analyses; returns the futures still outstanding."""
+        if block:
+            done, still_pending = set(futures), set()
+            concurrent.futures.wait(futures)
+        else:
+            done = {f for f in futures if f.done()}
+            still_pending = [f for f in futures if f not in done]
 
-    try:
-        previews = []
-        for seed in range(seed_start, seed_end + 1):
-            path = os.path.join(batch_dir, f"{seed}.png")
-            if os.path.exists(path):
-                previews.append((seed, path))
-
-        futures = [
-            analysis_pool.submit(classify, seed, path, args.out_dir, args.min_ratio, args.debug)
-            for seed, path in previews
-        ]
-
-        for future in concurrent.futures.as_completed(futures):
-            if shutdown_event.is_set():
-                return
+        for future in done:
             try:
                 seed, _ratio, log_entry, message = future.result()
             except Exception as e:
@@ -340,12 +382,50 @@ def process_batch(seed_start, seed_end, args, temp_base_dir, analysis_pool,
             with pbar_lock:
                 pbar.update(1)
 
-        if not shutdown_event.is_set():
-            with log_lock:
-                with open(progress_path, "a") as f:
-                    f.write(f"{seed_start} {seed_end}\n")
+        return list(still_pending)
+
+    pending = []
+    submitted = 0
+    try:
+        config_path = worker_configs_queue.get()
+        try:
+            for seed, path in generate_previews(seed_start, seed_end, batch_dir, args, config_path,
+                                                procs_lock, active_procs, shutdown_event):
+                submitted += 1
+                pending.append(
+                    analysis_pool.submit(classify, seed, path, args.out_dir, args.min_ratio, args.debug)
+                )
+                # Non-blocking, so rendering is never held up by analysis.
+                pending = harvest(pending, block=False)
+        finally:
+            worker_configs_queue.put(config_path)
+
+        if shutdown_event.is_set():
+            return
+
+        harvest(pending, block=True)
+        pending = []
+
+        expected = seed_end - seed_start + 1
+        if submitted < expected:
+            # Never record a batch as done when previews went missing: resume
+            # would skip seeds that were never actually scanned.
+            tqdm.write(
+                f"{get_timestamp()} Warning: batch {seed_start}-{seed_end} analyzed "
+                f"{submitted} of {expected} previews; not recording it as complete.",
+                file=sys.stdout,
+            )
+            with pbar_lock:
+                pbar.update(expected - submitted)
+            return
+
+        with log_lock:
+            with open(progress_path, "a") as f:
+                f.write(f"{seed_start} {seed_end}\n")
 
     finally:
+        for future in pending:
+            future.cancel()
         shutil.rmtree(batch_dir, ignore_errors=True)
 
 
