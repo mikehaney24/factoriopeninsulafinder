@@ -57,6 +57,8 @@ tqdm_utils.format_interval = custom_format_interval
 SEED_STRIDE = 2
 
 PROGRESS_FILENAME = "scan_progress.txt"
+CANDIDATES_FILENAME = "island_candidates.txt"
+CANDIDATES_DIRNAME = "candidates"
 
 # How often a running batch is scanned for newly-finished previews.
 PREVIEW_POLL_SECONDS = 0.25
@@ -602,7 +604,7 @@ def run_prescan(seed_start, seed_end, args, temp_base_dir, procs_lock, active_pr
                     seed, clear = int(parts[0]), int(parts[1])
                     screened += 1
                     if clear <= args.prescan_max_clear:
-                        candidates.append(seed)
+                        candidates.append((seed, clear))
 
         if screened != total:
             raise RuntimeError(f"prescan screened {screened} of {total} seeds in {seed_start}-{seed_end}")
@@ -661,10 +663,19 @@ def process_prescan_slice(seed_start, seed_end, args, temp_base_dir, analysis_po
         return
 
     total = seed_end - seed_start + 1
-    candidates = run_prescan(seed_start, seed_end, args, temp_base_dir,
-                             procs_lock, active_procs, shutdown_event)
+    scored = run_prescan(seed_start, seed_end, args, temp_base_dir,
+                         procs_lock, active_procs, shutdown_event)
     if shutdown_event.is_set():
         return
+    candidates = [seed for seed, _clear in scored]
+
+    # Record which seeds survived the screen. Re-screening to recover this list
+    # costs as much as the original scan, so it is always written.
+    if scored:
+        with log_lock:
+            with open(os.path.join(args.out_dir, CANDIDATES_FILENAME), "a") as f:
+                for seed, clear in scored:
+                    f.write(f"{seed} {clear}\n")
 
     with stats_lock:
         stats["screened"] += total
@@ -725,6 +736,18 @@ def process_prescan_slice(seed_start, seed_end, args, temp_base_dir, analysis_po
                 with open(progress_path, "a") as f:
                     f.write(f"{seed_start} {seed_end}\n")
     finally:
+        if args.keep_candidates:
+            # Whatever classify() did not claim as a match is a near-miss worth
+            # eyeballing; without this the previews are discarded unseen.
+            keep_dir = os.path.join(args.out_dir, CANDIDATES_DIRNAME)
+            os.makedirs(keep_dir, exist_ok=True)
+            for name in os.listdir(verify_dir):
+                if name.endswith(".png"):
+                    try:
+                        shutil.move(os.path.join(verify_dir, name),
+                                    os.path.join(keep_dir, f"CANDIDATE_seed_{name}"))
+                    except OSError:
+                        pass
         shutil.rmtree(verify_dir, ignore_errors=True)
         shutil.rmtree(os.path.join(temp_base_dir, f"prescan_{seed_start}"), ignore_errors=True)
 
@@ -781,6 +804,9 @@ def main():
                         help="Seeds screened per prescan pass (default: 50000). Bounds work lost to an interrupt.")
     parser.add_argument("--prescan-port-base", type=int, default=PRESCAN_PORT_BASE,
                         help=f"First UDP port for prescan servers (default: {PRESCAN_PORT_BASE}); one port per worker")
+    parser.add_argument("--keep-candidates", action="store_true",
+                        help=f"Keep the rendered preview of every prescan candidate in {CANDIDATES_DIRNAME}/, not just "
+                             f"the ones that match. Candidate seeds are always logged to {CANDIDATES_FILENAME}.")
     parser.add_argument("--debug", action="store_true", help="Generate and save debug visualization overlays for all scanned seeds")
 
     args = parser.parse_args()
