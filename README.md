@@ -9,6 +9,7 @@ An automated, high-performance scanner for Factorio map seeds that identifies de
 - **Batched Map Generation**: Renders hundreds of previews per Factorio process via `--map-gen-seed-max`, so the engine's ~1 s prototype-load cost is paid once per batch instead of once per seed.
 - **Multi-Core & Hyperthreading Parallelization**: Automatically detects and leverages all physical CPU cores and logical hyperthreads (e.g., 8, 16, 32 threads). Map generation runs across concurrent Factorio processes; image analysis runs in a separate process pool, so neither stage is bottlenecked by Python's GIL.
 - **Vectorized Analysis**: NumPy + SciPy connected-component labelling traces the spawn landmass in a single pass — roughly 40x faster than a per-pixel flood fill, with identical results.
+- **Island Prescan**: Optionally screens seeds using Factorio's terrain noise directly — no preview rendering — and only renders island candidates. Measured 43x faster with an identical match set. See [Island Prescan](#-island-prescan---island-prescan).
 - **Resumable Scans**: Completed batches are recorded, so an interrupted run picks up where it left off instead of restarting.
 - **Intelligent Geography Classification**: Analyzes pixel channel data and labels the connected starting landmass.
 - **Defensible Choke-Point Detection**: Measures the longest circular perimeter arc free of spawn land to detect natural defensive choke points.
@@ -159,6 +160,44 @@ Two consequences:
 | 2048 | 2048×2048 tiles | 312 | 3.2 |
 
 Because a smaller preview is a *crop* rather than a downscale, a low-resolution pre-screen is not possible — a seed that looks landlocked in a small window may still be a peninsula in a larger one. The one safe implication runs the other way: a seed classified `ISLAND` at a given size stays an island at every larger size, since its landmass is already fully enclosed.
+
+---
+
+## 🏝️ Island Prescan (`--island-prescan`)
+
+Islands are *rare* — a 100,000-seed scan can turn up none at all. Rendering a full preview for every seed just to reject it is the wrong shape of work, so this mode skips rendering entirely for the seeds it can rule out.
+
+Factorio will evaluate terrain elevation at arbitrary sparse points from Lua, without generating chunks. The prescan casts 64 rays from spawn to the edge of the `--size` window. An island's landmass is bounded, so **every** ray must cross water to leave it — meaning a single ray that reaches the edge on dry land is proof the seed is *not* an island. Survivors are rendered at full resolution and classified by the normal analyzer, so results are exact.
+
+```bash
+docker run --rm -it --platform linux/amd64 --tmpfs /tmp \
+  -v "$(pwd)/seed_previews:/app/seed_previews" \
+  factorio-peninsula-finder \
+  --island-prescan --start-seed 1000000 --count 1000000 --size 2048 --min-ratio 0.95
+```
+
+Measured over 2,000 seeds at `--size 2048`:
+
+| | exhaustive | `--island-prescan` |
+| :--- | ---: | ---: |
+| wall clock | 599 s | **14 s** |
+| per seed | 300 ms | **7 ms** |
+| seeds rendered | 2,000 | **4 (0.20%)** |
+| islands found | 1 | **1** (identical match set) |
+
+### It only works for islands
+
+The screen proves a seed is *not* an island. It cannot rank partial peninsulas: one still connects to the window edge across a wide arc, so plenty of rays run clear. On 498 seeds with ground truth, correlation between clear-ray count and the true free-border ratio was just **-0.287**, and seeds scoring ≥ 0.50 had up to 12 clear rays — a cutoff loose enough to keep them retains 56% of all seeds, which buys nothing.
+
+So `--island-prescan` **requires `--min-ratio >= 0.95`** and errors out otherwise. For ordinary peninsula hunting, use the normal path.
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--island-prescan` | `flag` | `False` | Enable the prescan. Requires `--min-ratio >= 0.95`. |
+| `--prescan-workers` | `int` | `8` | Headless servers used for screening. 8 is the measured optimum; throughput *falls* above it. |
+| `--prescan-max-clear` | `int` | `0` | Keep seeds with at most this many clear rays. `0` is exact for true islands; raise to admit near-islands at higher cost. |
+| `--prescan-slice` | `int` | `50000` | Seeds screened per pass. Bounds work lost to an interrupt. |
+| `--prescan-port-base` | `int` | `34197` | First UDP port; one per prescan worker. |
 
 ---
 
