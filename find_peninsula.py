@@ -3,6 +3,8 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "Pillow",
+#     "numpy",
+#     "scipy",
 #     "tqdm",
 # ]
 # ///
@@ -11,12 +13,16 @@ import argparse
 import concurrent.futures
 import os
 import queue
+import shutil
+import signal
 import subprocess
 import tempfile
 import threading
 import sys
-from collections import deque
 from datetime import datetime
+
+import numpy as np
+from scipy import ndimage
 from PIL import Image, ImageDraw
 
 from tqdm import tqdm
@@ -45,6 +51,13 @@ tqdm_std.format_interval = custom_format_interval
 tqdm_utils.format_interval = custom_format_interval
 # =========================================================
 
+# Factorio's --map-gen-seed-max renders every *second* seed in the interval,
+# so a contiguous range needs one pass per parity.
+SEED_STRIDE = 2
+
+PROGRESS_FILENAME = "scan_progress.txt"
+
+
 def get_cpu_count():
     """Returns available logical CPU cores/hyperthreads, respecting container affinity if set."""
     try:
@@ -52,125 +65,201 @@ def get_cpu_count():
     except (AttributeError, NotImplementedError, OSError):
         return os.cpu_count() or 4
 
-def analyze_perimeter_peninsula(image_path):
-    img = Image.open(image_path).convert("RGB")
-    width, height = img.size
-    pixels = img.load()
-    
-    def is_water(x, y):
-        r, g, b = pixels[x, y]
-        return b > r + 10 and b > g + 5
 
+# Only three colours in a default-preset preview satisfy the blue-channel test
+# (measured over 400 previews / 54M px): water (38,64,73) and (51,83,95), plus
+# iron ore (105,133,147). Ore's channel margins are indistinguishable from
+# shallow water's (b-r 42 vs 44, b-g 14 vs 12) -- brightness is what separates
+# them, with 33 points of headroom either side of the cut.
+WATER_MAX_BLUE = 128
+
+
+def water_mask(rgb):
+    """Boolean mask of water tiles, excluding blue-grey ore patches on land."""
+    r = rgb[..., 0].astype(np.int16)
+    g = rgb[..., 1].astype(np.int16)
+    b = rgb[..., 2].astype(np.int16)
+    return (b > r + 10) & (b > g + 5) & (b < WATER_MAX_BLUE)
+
+
+def find_spawn_pixel(water, width, height):
+    """Nearest non-water pixel to the image centre, searching outward as the original did."""
     cx, cy = width // 2, height // 2
-    start_found = False
-    
-    if not is_water(cx, cy):
-        start_found = True
-    else:
-        for r_search in range(1, 100):
-            offsets = [
-                (r_search, 0), (-r_search, 0), (0, r_search), (0, -r_search),
-                (r_search, r_search), (-r_search, -r_search), (r_search, -r_search), (-r_search, r_search)
-            ]
-            for dx, dy in offsets:
-                nx, ny = cx + dx, cy + dy
-                if 0 <= nx < width and 0 <= ny < height and not is_water(nx, ny):
-                    cx, cy = nx, ny
-                    start_found = True
-                    break
-            if start_found:
-                break
+    if not water[cy, cx]:
+        return cx, cy, True
+
+    for r_search in range(1, 100):
+        offsets = [
+            (r_search, 0), (-r_search, 0), (0, r_search), (0, -r_search),
+            (r_search, r_search), (-r_search, -r_search), (r_search, -r_search), (-r_search, r_search)
+        ]
+        for dx, dy in offsets:
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < width and 0 <= ny < height and not water[ny, nx]:
+                return nx, ny, True
+
+    return cx, cy, False
+
+
+def border_ring(mask):
+    """Border pixels in clockwise order: top row, right column, bottom row, left column."""
+    return np.concatenate([
+        mask[0, :],
+        mask[1:, -1],
+        mask[-1, -2::-1],
+        mask[-2:0:-1, 0],
+    ])
+
+
+def border_ring_coords(width, height):
+    """(x, y) coordinates matching border_ring's ordering."""
+    xs = np.concatenate([
+        np.arange(width),
+        np.full(height - 1, width - 1),
+        np.arange(width - 2, -1, -1),
+        np.zeros(height - 2, dtype=int),
+    ])
+    ys = np.concatenate([
+        np.zeros(width, dtype=int),
+        np.arange(1, height),
+        np.full(width - 1, height - 1),
+        np.arange(height - 2, 0, -1),
+    ])
+    return xs, ys
+
+
+def longest_circular_run(flags):
+    """Length and start index of the longest wrap-around run of True in `flags`."""
+    n = flags.size
+    if n == 0:
+        return 0, -1
+    if flags.all():
+        return n, 0
+    if not flags.any():
+        # Spawn landmass reaches the whole border: no free arc at all.
+        return 0, -1
+
+    doubled = np.concatenate([flags, flags])
+    padded = np.concatenate([[False], doubled, [False]])
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    starts, ends = edges[::2], edges[1::2]
+    lengths = ends - starts
+
+    best = int(lengths.argmax())
+    return min(int(lengths[best]), n), int(starts[best])
+
+
+def analyze_perimeter_peninsula(image_path):
+    """Returns (free_border_ratio, save_debug_image) for a Factorio map preview."""
+    img = Image.open(image_path)
+    arr = np.asarray(img)
+    height, width = arr.shape[:2]
+    rgb = arr[..., :3]
+
+    water = water_mask(rgb)
+    cx, cy, start_found = find_spawn_pixel(water, width, height)
 
     if not start_found:
         def save_empty_debug(debug_path):
-            annotated_img = img.copy()
+            annotated_img = img.convert("RGB")
             draw = ImageDraw.Draw(annotated_img)
-            draw.ellipse([(cx-5, cy-5), (cx+5, cy+5)], fill=(255, 0, 0))
+            draw.ellipse([(cx - 5, cy - 5), (cx + 5, cy + 5)], fill=(255, 0, 0))
             annotated_img.save(debug_path)
         return 1.0, save_empty_debug
 
-    visited = bytearray(width * height)
-    visited[cy * width + cx] = 1
-    
-    queue_pixels = deque([(cx, cy)])
-    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    
-    while queue_pixels:
-        px, py = queue_pixels.popleft()
-        for dx, dy in directions:
-            nx, ny = px + dx, py + dy
-            if 0 <= nx < width and 0 <= ny < height:
-                idx = ny * width + nx
-                if not visited[idx] and not is_water(nx, ny):
-                    visited[idx] = 1
-                    queue_pixels.append((nx, ny))
+    labels, _ = ndimage.label(~water)
+    visited = labels == labels[cy, cx]
 
-    perimeter_pixels = []
-    for x in range(width): perimeter_pixels.append((x, 0))
-    for y in range(1, height): perimeter_pixels.append((width - 1, y))
-    for x in range(width - 2, -1, -1): perimeter_pixels.append((x, height - 1))
-    for y in range(height - 2, 0, -1): perimeter_pixels.append((0, y))
-
-    is_non_spawn_border = [visited[py * width + px] == 0 for px, py in perimeter_pixels]
-    doubled_border = is_non_spawn_border + is_non_spawn_border
-    
-    max_arc = 0
-    current_arc = 0
-    for is_non_spawn in doubled_border:
-        if is_non_spawn:
-            current_arc += 1
-            max_arc = max(max_arc, current_arc)
-        else:
-            current_arc = 0
-            
-    max_arc = min(max_arc, len(perimeter_pixels))
-    free_border_ratio = max_arc / len(perimeter_pixels)
+    is_non_spawn_border = ~border_ring(visited)
+    max_arc, arc_start_idx = longest_circular_run(is_non_spawn_border)
+    free_border_ratio = max_arc / is_non_spawn_border.size
 
     def save_debug_image(debug_path):
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 150))
-        overlay_pixels = overlay.load()
-        
-        for y in range(height):
-            row_idx = y * width
-            for x in range(width):
-                if visited[row_idx + x]:
-                    overlay_pixels[x, y] = (0, 255, 0, 150)
-                    
-        annotated_img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        # Uniform 150/255 dark overlay, green where the spawn landmass was traced.
+        base = rgb.astype(np.uint16)
+        tint = np.zeros_like(base)
+        tint[..., 1] = np.where(visited, 255, 0)
+        blended = (base * 105 + tint * 150 + 127) // 255
+
+        annotated_img = Image.fromarray(blended.astype(np.uint8), "RGB")
         draw = ImageDraw.Draw(annotated_img)
-        
-        arc_start_idx = "".join(['1' if b else '0' for b in doubled_border]).find('1' * max_arc)
-        if arc_start_idx != -1:
+
+        if arc_start_idx != -1 and max_arc > 0:
+            xs, ys = border_ring_coords(width, height)
+            ring_len = xs.size
             for i in range(arc_start_idx, arc_start_idx + max_arc):
-                px, py = perimeter_pixels[i % len(perimeter_pixels)]
-                draw.rectangle([px-2, py-2, px+2, py+2], fill=(0, 100, 255))
-                
-        draw.ellipse([(cx-5, cy-5), (cx+5, cy+5)], fill=(255, 0, 0))
+                px, py = int(xs[i % ring_len]), int(ys[i % ring_len])
+                draw.rectangle([px - 2, py - 2, px + 2, py + 2], fill=(0, 100, 255))
+
+        draw.ellipse([(cx - 5, cy - 5), (cx + 5, cy + 5)], fill=(255, 0, 0))
         annotated_img.save(debug_path)
 
     return free_border_ratio, save_debug_image
 
+
 def get_timestamp():
     return f"[{datetime.now().strftime('%H:%M:%S')}]"
 
-def process_seed(seed, args, seed_log_path, log_lock, procs_lock, active_procs, matches, shutdown_event, worker_configs_queue):
-    if shutdown_event.is_set():
-        return
-        
-    temp_file = os.path.join(args.out_dir, f"temp_preview_{seed}.png")
-    debug_file = os.path.join(args.out_dir, f"DEBUG_seed_{seed}.png")
-    
-    config_path = worker_configs_queue.get()
-    proc = None
-    try:
+
+def classify(seed, preview_path, out_dir, min_ratio, debug):
+    """Analyze one preview, save it if it matches, and return (seed, ratio, log_entry).
+
+    Runs inside a worker process, so everything here must be picklable input/output only.
+    """
+    debug_file = os.path.join(out_dir, f"DEBUG_seed_{seed}.png")
+    free_border_ratio, save_debug_func = analyze_perimeter_peninsula(preview_path)
+
+    if free_border_ratio == 1.0:
+        match_filename = os.path.join(out_dir, f"ISLAND_seed_{seed}.png")
+        log_entry = f"{seed} - ISLAND (100% free border)\n"
+        message = f"[ ISLAND ] Seed {seed}: 100% free border! True island detected -> Saved"
+    elif 0.95 <= free_border_ratio < 1.0:
+        match_filename = os.path.join(out_dir, f"POSSIBLE_ISLAND_seed_{seed}_{int(free_border_ratio*100)}pct.png")
+        log_entry = f"{seed} - POSSIBLE ISLAND ({free_border_ratio:.1%} free border)\n"
+        message = f"[ POSSIBLE ISLAND ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved"
+    elif free_border_ratio >= min_ratio:
+        match_filename = os.path.join(out_dir, f"PENINSULA_seed_{seed}_{int(free_border_ratio*100)}pct.png")
+        log_entry = f"{seed} - PENINSULA ({free_border_ratio:.1%} free border)\n"
+        message = f"[ MATCH ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved"
+    else:
+        if debug and save_debug_func:
+            save_debug_func(debug_file)
+        return seed, free_border_ratio, None, None
+
+    if os.path.exists(match_filename):
+        os.remove(match_filename)
+    # The preview lives in a temp dir that is usually a different device to out_dir.
+    shutil.move(preview_path, match_filename)
+    if save_debug_func:
+        save_debug_func(debug_file)
+
+    return seed, free_border_ratio, log_entry, message
+
+
+def generate_previews(seed_start, seed_end, batch_dir, args, config_path,
+                      procs_lock, active_procs, shutdown_event):
+    """Render every seed in [seed_start, seed_end] into batch_dir as <seed>.png.
+
+    One Factorio process per parity: --map-gen-seed-max walks the interval in
+    steps of SEED_STRIDE, so a contiguous range needs SEED_STRIDE passes. Each
+    process pays the ~1s prototype-load cost once for the whole batch.
+    """
+    os.makedirs(batch_dir, exist_ok=True)
+
+    for offset in range(SEED_STRIDE):
         if shutdown_event.is_set():
             return
-            
+
+        first = seed_start + offset
+        if first > seed_end:
+            continue
+
         cmd = [
             args.factorio_bin,
             "-c", config_path,
-            "--generate-map-preview", temp_file,
-            "--map-gen-seed", str(seed),
+            "--generate-map-preview", batch_dir + os.sep,
+            "--map-gen-seed", str(first),
+            "--map-gen-seed-max", str(seed_end),
             "--map-preview-size", str(args.size),
             "--preset", args.preset
         ]
@@ -178,90 +267,117 @@ def process_seed(seed, args, seed_log_path, log_lock, procs_lock, active_procs, 
             cmd.extend(["--map-gen-settings", args.map_gen_settings])
         if args.map_settings:
             cmd.extend(["--map-settings", args.map_settings])
-            
+
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         with procs_lock:
             active_procs.add(proc)
-            
-        _, stderr_out = proc.communicate()
-        
-        with procs_lock:
-            active_procs.discard(proc)
-            
+        try:
+            _, stderr_out = proc.communicate()
+        finally:
+            with procs_lock:
+                active_procs.discard(proc)
+
         if shutdown_event.is_set():
             return
-            
+
         if proc.returncode != 0:
             err_line = stderr_out.strip().splitlines()[-1] if stderr_out and stderr_out.strip() else ""
             err_suffix = f": {err_line}" if err_line else ""
-            tqdm.write(f"{get_timestamp()} Warning: Factorio exited with code {proc.returncode} for seed {seed}{err_suffix}", file=sys.stdout)
-            return
-            
-        if not os.path.exists(temp_file):
-            return
+            tqdm.write(
+                f"{get_timestamp()} Warning: Factorio exited with code {proc.returncode} "
+                f"for seeds {first}-{seed_end}{err_suffix}",
+                file=sys.stdout,
+            )
 
-        free_border_ratio, save_debug_func = analyze_perimeter_peninsula(temp_file)
-        match_found = False
-        log_entry = ""
-        
-        if free_border_ratio == 1.0:
-            match_filename = os.path.join(args.out_dir, f"ISLAND_seed_{seed}.png")
-            if os.path.exists(match_filename):
-                os.remove(match_filename)
-            os.rename(temp_file, match_filename)
-            if save_debug_func:
-                save_debug_func(debug_file)
-            tqdm.write(f"{get_timestamp()} [ ISLAND ] Seed {seed}: 100% free border! True island detected -> Saved", file=sys.stdout)
-            match_found = True
-            log_entry = f"{seed} - ISLAND (100% free border)\n"
-            
-        elif 0.95 <= free_border_ratio < 1.0:
-            match_filename = os.path.join(args.out_dir, f"POSSIBLE_ISLAND_seed_{seed}_{int(free_border_ratio*100)}pct.png")
-            if os.path.exists(match_filename):
-                os.remove(match_filename)
-            os.rename(temp_file, match_filename)
-            if save_debug_func:
-                save_debug_func(debug_file)
-            tqdm.write(f"{get_timestamp()} [ POSSIBLE ISLAND ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved", file=sys.stdout)
-            match_found = True
-            log_entry = f"{seed} - POSSIBLE ISLAND ({free_border_ratio:.1%} free border)\n"
-            
-        elif free_border_ratio >= args.min_ratio:
-            match_filename = os.path.join(args.out_dir, f"PENINSULA_seed_{seed}_{int(free_border_ratio*100)}pct.png")
-            if os.path.exists(match_filename):
-                os.remove(match_filename)
-            os.rename(temp_file, match_filename)
-            if save_debug_func:
-                save_debug_func(debug_file)
-            tqdm.write(f"{get_timestamp()} [ MATCH ] Seed {seed}: {free_border_ratio:.1%} free border! -> Saved", file=sys.stdout)
-            match_found = True
-            log_entry = f"{seed} - PENINSULA ({free_border_ratio:.1%} free border)\n"
-            
-        else:
-            if args.debug and save_debug_func:
-                save_debug_func(debug_file)
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-            
-        if match_found:
-            with log_lock:
-                matches.append(seed)
-                with open(seed_log_path, "a") as f:
-                    f.write(log_entry)
-            
-    except Exception as e:
-        if not shutdown_event.is_set():
-            tqdm.write(f"{get_timestamp()} Error analyzing seed {seed}: {e}", file=sys.stdout)
+
+def process_batch(seed_start, seed_end, args, temp_base_dir, analysis_pool,
+                  seed_log_path, log_lock, procs_lock, active_procs, matches,
+                  shutdown_event, worker_configs_queue, progress_path, pbar, pbar_lock):
+    """Generate one batch of previews, then fan the analysis out across processes."""
+    if shutdown_event.is_set():
+        return
+
+    batch_dir = os.path.join(temp_base_dir, f"batch_{seed_start}")
+    config_path = worker_configs_queue.get()
+    try:
+        generate_previews(seed_start, seed_end, batch_dir, args, config_path,
+                          procs_lock, active_procs, shutdown_event)
     finally:
         worker_configs_queue.put(config_path)
-        with procs_lock:
-            if proc:
-                active_procs.discard(proc)
-        if os.path.exists(temp_file):
+
+    if shutdown_event.is_set():
+        return
+
+    try:
+        previews = []
+        for seed in range(seed_start, seed_end + 1):
+            path = os.path.join(batch_dir, f"{seed}.png")
+            if os.path.exists(path):
+                previews.append((seed, path))
+
+        futures = [
+            analysis_pool.submit(classify, seed, path, args.out_dir, args.min_ratio, args.debug)
+            for seed, path in previews
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            if shutdown_event.is_set():
+                return
             try:
-                os.remove(temp_file)
-            except OSError:
-                pass
+                seed, _ratio, log_entry, message = future.result()
+            except Exception as e:
+                tqdm.write(f"{get_timestamp()} Error analyzing a seed in batch {seed_start}: {e}", file=sys.stdout)
+                with pbar_lock:
+                    pbar.update(1)
+                continue
+
+            if log_entry:
+                tqdm.write(f"{get_timestamp()} {message}", file=sys.stdout)
+                with log_lock:
+                    matches.append(seed)
+                    with open(seed_log_path, "a") as f:
+                        f.write(log_entry)
+            with pbar_lock:
+                pbar.update(1)
+
+        if not shutdown_event.is_set():
+            with log_lock:
+                with open(progress_path, "a") as f:
+                    f.write(f"{seed_start} {seed_end}\n")
+
+    finally:
+        shutil.rmtree(batch_dir, ignore_errors=True)
+
+
+# Amortizing engine startup pulls batches larger; keeping every worker busy pulls
+# them smaller. Auto-sizing targets one batch per worker, bounded so tiny scans
+# still amortize and huge scans keep resume granularity usable.
+MIN_AUTO_BATCH = 16
+MAX_AUTO_BATCH = 512
+
+
+def resolve_batch_size(requested, count, workers):
+    if requested is not None:
+        return max(1, requested)
+    per_worker = count // max(workers, 1)
+    return max(MIN_AUTO_BATCH, min(MAX_AUTO_BATCH, per_worker))
+
+
+def load_completed_chunks(progress_path):
+    """Chunk (start, end) pairs already finished by an earlier run."""
+    completed = set()
+    if not os.path.exists(progress_path):
+        return completed
+    with open(progress_path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    completed.add((int(parts[0]), int(parts[1])))
+                except ValueError:
+                    continue
+    return completed
+
 
 def main():
     detected_cpus = get_cpu_count()
@@ -278,39 +394,89 @@ def main():
     parser.add_argument("--preset", default="default", help="Map generation preset (e.g. default, rail-world, death-world)")
     parser.add_argument("--map-gen-settings", default=None, help="Optional path to map-gen-settings.json")
     parser.add_argument("--map-settings", default=None, help="Optional path to map-settings.json")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Seeds rendered per Factorio process (default: auto — sized so every worker gets a batch). "
+                             "Larger amortizes engine startup further; too large and there are fewer batches than workers, "
+                             "leaving cores idle.")
+    parser.add_argument("--temp-dir", default=None,
+                        help="Scratch directory for previews being analyzed (default: system temp). Keep this off a bind mount.")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Rescan chunks already recorded in scan_progress.txt instead of skipping them")
     parser.add_argument("--debug", action="store_true", help="Generate and save debug visualization overlays for all scanned seeds")
-    
+
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
-    
+
     seed_log_path = os.path.join(args.out_dir, args.out_file)
-    
-    print(f"{get_timestamp()} Scanning {args.count} seeds starting from {args.start_seed} using {args.workers} parallel workers...\n")
-    
+    progress_path = os.path.join(args.out_dir, PROGRESS_FILENAME)
+
+    batch_size = resolve_batch_size(args.batch_size, args.count, args.workers)
+    chunks = []
+    for chunk_start in range(args.start_seed, args.start_seed + args.count, batch_size):
+        chunk_end = min(chunk_start + batch_size, args.start_seed + args.count) - 1
+        chunks.append((chunk_start, chunk_end))
+
+    skipped_seeds = 0
+    if not args.no_resume:
+        completed = load_completed_chunks(progress_path)
+        if completed:
+            remaining = [c for c in chunks if c not in completed]
+            skipped_seeds = sum(end - start + 1 for start, end in chunks if (start, end) in completed)
+            if skipped_seeds:
+                print(f"{get_timestamp()} Resuming: skipping {skipped_seeds} seeds already scanned "
+                      f"({len(chunks) - len(remaining)} of {len(chunks)} batches complete).")
+            chunks = remaining
+
+    total_to_scan = sum(end - start + 1 for start, end in chunks)
+
+    print(f"{get_timestamp()} Scanning {total_to_scan} seeds starting from {args.start_seed} using {args.workers} parallel workers "
+          f"({len(chunks)} batches of up to {batch_size})...\n")
+
+    if not chunks:
+        print(f"{get_timestamp()} Nothing to do. Pass --no-resume to rescan.")
+        return
+
     matches = []
     log_lock = threading.Lock()
     procs_lock = threading.Lock()
+    pbar_lock = threading.Lock()
     active_procs = set()
     shutdown_event = threading.Event()
-    
+
+    def handle_sigint(_signum, _frame):
+        # Kill Factorio immediately rather than waiting for the executor to drain;
+        # batches are long-lived now, so relying on the with-block exit would hang.
+        if shutdown_event.is_set():
+            return
+        shutdown_event.set()
+        tqdm.write(f"\n{get_timestamp()} Scan interrupted by user. Terminating active workers...", file=sys.stdout)
+        with procs_lock:
+            for p in list(active_procs):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
     # Progress bar with dynamic time display
     pbar = tqdm(
-        total=args.count, 
-        ascii=".o", 
+        total=total_to_scan,
+        ascii=".o",
         bar_format="Factorio{bar} | {percentage:3.0f}% | {n_fmt}/{total_fmt} seeds | ETA: {remaining}",
         file=sys.stdout
     )
-    
+
     stop_refresh = threading.Event()
     def background_refresh():
         while not stop_refresh.wait(1.0):
             pbar.refresh()
-            
+
     refresher_thread = threading.Thread(target=background_refresh)
     refresher_thread.daemon = True
     refresher_thread.start()
 
-    with tempfile.TemporaryDirectory(prefix="factorio_workers_") as temp_base_dir:
+    with tempfile.TemporaryDirectory(prefix="factorio_workers_", dir=args.temp_dir) as temp_base_dir:
         worker_configs_queue = queue.Queue()
         for i in range(args.workers):
             w_dir = os.path.join(temp_base_dir, f"worker_{i}")
@@ -320,47 +486,51 @@ def main():
                 f.write(f"[path]\nread-data=__PATH__executable__/../../data\nwrite-data={w_dir}\n")
             worker_configs_queue.put(cfg_path)
 
+        analysis_pool = concurrent.futures.ProcessPoolExecutor(max_workers=args.workers)
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-                futures = {
+                futures = [
                     executor.submit(
-                        process_seed,
-                        args.start_seed + i,
+                        process_batch,
+                        chunk_start,
+                        chunk_end,
                         args,
+                        temp_base_dir,
+                        analysis_pool,
                         seed_log_path,
                         log_lock,
                         procs_lock,
                         active_procs,
                         matches,
                         shutdown_event,
-                        worker_configs_queue
-                    ): (args.start_seed + i)
-                    for i in range(args.count)
-                }
-                
+                        worker_configs_queue,
+                        progress_path,
+                        pbar,
+                        pbar_lock,
+                    )
+                    for chunk_start, chunk_end in chunks
+                ]
+
                 for future in concurrent.futures.as_completed(futures):
-                    if shutdown_event.is_set():
-                        break
-                    pbar.update(1)
-                    
-        except KeyboardInterrupt:
-            shutdown_event.set()
-            tqdm.write(f"\n{get_timestamp()} Scan interrupted by user. Terminating active workers...", file=sys.stdout)
-            with procs_lock:
-                for p in list(active_procs):
                     try:
-                        p.kill()
-                    except OSError:
-                        pass
-            sys.exit(0)
+                        future.result()
+                    except Exception as e:
+                        tqdm.write(f"{get_timestamp()} Batch failed: {e}", file=sys.stdout)
 
         finally:
+            analysis_pool.shutdown(wait=not shutdown_event.is_set(), cancel_futures=shutdown_event.is_set())
             stop_refresh.set()
             if refresher_thread.is_alive():
                 refresher_thread.join()
             pbar.close()
+        # Leaving the with-block removes temp_base_dir, so no previews are orphaned.
 
-    print(f"\n{get_timestamp()} Scan complete. Found {len(matches)} matching seeds.")
+    if shutdown_event.is_set():
+        print(f"\n{get_timestamp()} Stopped after {len(matches)} matches. Completed batches are recorded in "
+              f"{progress_path}; rerun the same command to resume.")
+    else:
+        print(f"\n{get_timestamp()} Scan complete. Found {len(matches)} matching seeds.")
+
 
 if __name__ == "__main__":
     main()
