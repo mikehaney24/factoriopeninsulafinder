@@ -186,16 +186,22 @@ Measured over 500,000 seeds at `--size 2048`:
 
 ### What you trade for that
 
-**The prescan is deliberately incomplete for peninsulas.** It keeps only seeds where spawn is enclosed in *every* direction, so many qualifying peninsulas are never rendered — on 498 seeds with ground truth, 1 of the 4 scoring ≥ 0.50 survived the screen. Correlation between clear-ray count and the true free-border ratio is only **-0.287**.
+**The prescan targets enclosed landmasses, not peninsulas generally.** It's aimed at islands and near-islands, and it cuts cleanly just below that band. On 2,000 seeds compared against a full exhaustive scan:
 
-What it returns instead is heavily enriched for the highly-enclosed tail:
-
-| | random seeds | prescan candidates |
+| true ratio | exhaustive found | prescan found |
 | :--- | ---: | ---: |
-| scoring ≥ 0.50 | 0.8% | **7.8%** |
-| median ratio | 0.143 | **0.216** |
+| ≥ 0.70 | 2 | **2** |
+| 0.50 – 0.67 | 8 | 1 |
 
-So the default finds *fewer but better* peninsulas per seed scanned, far faster. If you need every qualifying seed — a complete census rather than the best examples — use **`--exhaustive`**, which renders and analyzes every seed using batched generation.
+Everything it dropped was a marginal peninsula in the low 0.5s. Candidates overall are enriched roughly **10×** over random seeds for scoring ≥ 0.50 (7.8% vs 0.8%).
+
+If you need every qualifying seed — a complete census rather than the best examples — use **`--exhaustive`**, which renders and analyzes every seed using batched generation.
+
+### Two things the rays account for
+
+**The forced starting-area pond.** Vanilla guarantees water near spawn for offshore pumps. Rays starting at spawn get blocked by that pond rather than by real enclosure — measured over 19,200 rays, **15.8% first hit water inside 100 tiles**, then almost nothing between 100 and 300, then natural terrain resumes. Sampling therefore begins at `--prescan-ray-start` (default 300), which cut false candidates by about a third with no loss of true positives.
+
+**Narrow isthmuses.** A landmass joined to the mainland by a thin neck — the classic "very nearly an island" — has a few rays threading that neck, so demanding *zero* clear rays rejects exactly the cases worth finding. `--prescan-max-clear` is a **work dial, not a quality dial**: over 50,000 seeds the median candidate ratio was flat across clear counts 0–3 (0.215, 0.209, 0.196, 0.182) while the ≥ 0.70 rate *rose* (0%, 0%, 0.4%, 0.47%), and the two best landmasses found — **0.846 and 0.757** — both sat at clear = 3. Loosening it renders more and finds proportionally more; it does not dilute quality.
 
 ### Prescan options
 
@@ -203,7 +209,8 @@ So the default finds *fewer but better* peninsulas per seed scanned, far faster.
 | :--- | :--- | :--- | :--- |
 | `--exhaustive` | `flag` | `False` | Render every seed instead of prescreening. Complete but ~57x slower. |
 | `--prescan-workers` | `int` | `8` | Headless servers used for screening. 8 is the measured optimum; throughput *falls* above it. |
-| `--prescan-max-clear` | `int` | `0` | Keep seeds with at most this many clear rays. `0` requires full enclosure; raise it to admit more (and render more). |
+| `--prescan-max-clear` | `int` | `3` | Keep seeds with at most this many of 64 rays reaching the edge on dry land. A work dial, not a quality dial — raise it to render more and find proportionally more near-islands. |
+| `--prescan-ray-start` | `int` | `300` | Distance from spawn (tiles) where rays begin, skipping the forced starting-area water. |
 | `--prescan-slice` | `int` | `50000` | Seeds screened per pass. Bounds work lost to an interrupt. |
 | `--prescan-port-base` | `int` | `34197` | First UDP port; one per prescan worker. |
 | `--keep-candidates` | `flag` | `False` | Keep every candidate's rendered preview under `candidates/`, not just matches. |
