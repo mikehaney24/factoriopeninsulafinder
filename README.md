@@ -9,6 +9,7 @@ An automated, high-performance scanner for Factorio map seeds that identifies de
 - **Batched Map Generation**: Renders hundreds of previews per Factorio process via `--map-gen-seed-max`, so the engine's ~1 s prototype-load cost is paid once per batch instead of once per seed.
 - **Multi-Core & Hyperthreading Parallelization**: Automatically detects and leverages all physical CPU cores and logical hyperthreads (e.g., 8, 16, 32 threads). Map generation runs across concurrent Factorio processes; image analysis runs in a separate process pool, so neither stage is bottlenecked by Python's GIL.
 - **Vectorized Analysis**: NumPy + SciPy connected-component labelling traces the spawn landmass in a single pass — roughly 40x faster than a per-pixel flood fill, with identical results.
+- **Noise Prescan by Default**: Screens seeds using Factorio's terrain noise directly — no preview rendering — and only renders seeds where spawn is nearly or fully enclosed by water. **5.2 ms/seed instead of 300 ms.** Aimed at islands and near-islands rather than a complete census; `--exhaustive` restores the full scan. See [How Seeds Are Screened](#-how-seeds-are-screened-the-default).
 - **Resumable Scans**: Completed batches are recorded, so an interrupted run picks up where it left off instead of restarting.
 - **Intelligent Geography Classification**: Analyzes pixel channel data and labels the connected starting landmass.
 - **Defensible Choke-Point Detection**: Measures the longest circular perimeter arc free of spawn land to detect natural defensive choke points.
@@ -159,6 +160,64 @@ Two consequences:
 | 2048 | 2048×2048 tiles | 312 | 3.2 |
 
 Because a smaller preview is a *crop* rather than a downscale, a low-resolution pre-screen is not possible — a seed that looks landlocked in a small window may still be a peninsula in a larger one. The one safe implication runs the other way: a seed classified `ISLAND` at a given size stays an island at every larger size, since its landmass is already fully enclosed.
+
+---
+
+## 🔎 How Seeds Are Screened (the default)
+
+Rendering a full preview for every seed just to reject almost all of them is the wrong shape of work. By default this tool doesn't render first — it asks Factorio for the terrain directly.
+
+Factorio evaluates terrain elevation at arbitrary sparse points from Lua, **without generating chunks**. The prescan casts 64 rays from spawn to the edge of the `--size` window. If a landmass is bounded, **every** ray must cross water to leave it — so a single ray reaching the edge on dry land proves spawn isn't enclosed. Only survivors get rendered at full resolution and classified by the normal analyzer, so every reported match is exact.
+
+```bash
+docker run --rm -it --platform linux/amd64 --tmpfs /tmp \
+  -v "$(pwd)/seed_previews:/app/seed_previews" \
+  factorio-peninsula-finder \
+  --start-seed 1000000 --count 1000000 --size 2048
+```
+
+Measured over 500,000 seeds at `--size 2048`:
+
+| | `--exhaustive` | default |
+| :--- | ---: | ---: |
+| wall clock | ~41.7 h | **43 min** |
+| per seed | ~300 ms | **5.2 ms** |
+| seeds rendered | 500,000 | **334 (0.07%)** |
+
+### What you trade for that
+
+**The prescan targets enclosed landmasses, not peninsulas generally.** It's aimed at islands and near-islands, and it cuts cleanly just below that band. On 2,000 seeds compared against a full exhaustive scan:
+
+| true ratio | exhaustive found | prescan found |
+| :--- | ---: | ---: |
+| ≥ 0.70 | 2 | **2** |
+| 0.50 – 0.67 | 8 | 1 |
+
+Everything it dropped was a marginal peninsula in the low 0.5s. Candidates overall are enriched roughly **10×** over random seeds for scoring ≥ 0.50 (7.8% vs 0.8%).
+
+If you need every qualifying seed — a complete census rather than the best examples — use **`--exhaustive`**, which renders and analyzes every seed using batched generation.
+
+### Two things the rays account for
+
+**The forced starting-area pond.** Vanilla guarantees water near spawn for offshore pumps. Rays starting at spawn get blocked by that pond rather than by real enclosure — measured over 19,200 rays, **15.8% first hit water inside 100 tiles**, then almost nothing between 100 and 300, then natural terrain resumes. Sampling therefore begins at `--prescan-ray-start` (default 300), which cut false candidates by about a third with no loss of true positives.
+
+**Narrow isthmuses.** A landmass joined to the mainland by a thin neck — the classic "very nearly an island" — has a few rays threading that neck, so demanding *zero* clear rays rejects exactly the cases worth finding. `--prescan-max-clear` is a **work dial, not a quality dial**: over 50,000 seeds the median candidate ratio was flat across clear counts 0–3 (0.215, 0.209, 0.196, 0.182) while the ≥ 0.70 rate *rose* (0%, 0%, 0.4%, 0.47%), and the two best landmasses found — **0.846 and 0.757** — both sat at clear = 3. Loosening it renders more and finds proportionally more; it does not dilute quality.
+
+### Prescan options
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--exhaustive` | `flag` | `False` | Render every seed instead of prescreening. Complete but ~57x slower. |
+| `--prescan-workers` | `int` | `8` | Headless servers used for screening. 8 is the measured optimum; throughput *falls* above it. |
+| `--prescan-max-clear` | `int` | `3` | Keep seeds with at most this many of 64 rays reaching the edge on dry land. A work dial, not a quality dial — raise it to render more and find proportionally more near-islands. |
+| `--prescan-ray-start` | `int` | `300` | Distance from spawn (tiles) where rays begin, skipping the forced starting-area water. |
+| `--prescan-slice` | `int` | `50000` | Seeds screened per pass. Bounds work lost to an interrupt. |
+| `--prescan-port-base` | `int` | `34197` | First UDP port; one per prescan worker. |
+| `--keep-candidates` | `flag` | `False` | Keep every candidate's rendered preview under `candidates/`, not just matches. |
+
+Candidate seeds and their clear-ray counts are **always** appended to `island_candidates.txt`, since re-screening to recover that list costs as much as the original scan. Add `--keep-candidates` to also retain the previews themselves — useful for eyeballing near-misses, at roughly 1.3 MB per candidate at `--size 2048`.
+
+> **On islands specifically:** 500,000 seeds at `--size 2048` produced **zero**. The best candidate scored 0.919. Default map generation appears not to produce spawn islands at any practical rate; raising water coverage via `--map-gen-settings` is the lever if you want them.
 
 ---
 
