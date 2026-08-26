@@ -6,11 +6,11 @@ An automated, high-performance scanner for Factorio map seeds that identifies de
 
 ## ⚡ Key Features
 
-- **Batched Map Generation**: Renders hundreds of previews per Factorio process via `--map-gen-seed-max`, so the engine's ~1 s prototype-load cost is paid once per batch instead of once per seed.
-- **Multi-Core & Hyperthreading Parallelization**: Automatically detects and leverages all physical CPU cores and logical hyperthreads (e.g., 8, 16, 32 threads). Map generation runs across concurrent Factorio processes; image analysis runs in a separate process pool, so neither stage is bottlenecked by Python's GIL.
+- **Noise Prescan by Default**: Asks Factorio for terrain elevation directly instead of rendering previews, and only renders the seeds where spawn is nearly or fully enclosed by water. **5.2 ms/seed instead of 300 ms** — 500,000 seeds in 43 minutes rather than ~42 hours. Aimed at islands and near-islands rather than a complete census. See [How Seeds Are Screened](#-how-seeds-are-screened-the-default).
+- **Exhaustive Mode**: `--exhaustive` renders and analyzes every seed, using batched generation via `--map-gen-seed-max` so the engine's ~1 s prototype-load cost is paid once per batch instead of once per seed.
+- **Multi-Core & Hyperthreading Parallelization**: Screening runs across 8 headless servers; candidate rendering and image analysis run across all cores in separate process pools, so no stage is bottlenecked by Python's GIL.
 - **Vectorized Analysis**: NumPy + SciPy connected-component labelling traces the spawn landmass in a single pass — roughly 40x faster than a per-pixel flood fill, with identical results.
-- **Noise Prescan by Default**: Screens seeds using Factorio's terrain noise directly — no preview rendering — and only renders seeds where spawn is nearly or fully enclosed by water. **5.2 ms/seed instead of 300 ms.** Aimed at islands and near-islands rather than a complete census; `--exhaustive` restores the full scan. See [How Seeds Are Screened](#-how-seeds-are-screened-the-default).
-- **Resumable Scans**: Completed batches are recorded, so an interrupted run picks up where it left off instead of restarting.
+- **Resumable Scans**: Completed slices are recorded, so an interrupted run picks up where it left off instead of restarting.
 - **Intelligent Geography Classification**: Analyzes pixel channel data and labels the connected starting landmass.
 - **Defensible Choke-Point Detection**: Measures the longest circular perimeter arc free of spawn land to detect natural defensive choke points.
 - **Automatic Visual Overlays**: Saves both the clean Factorio map preview and an annotated overlay (`DEBUG_seed_<seed>.png`) for all matching seeds.
@@ -20,15 +20,18 @@ An automated, high-performance scanner for Factorio map seeds that identifies de
 
 ## 🔍 How It Works
 
-1. **Batched Headless Generation**: Invokes the Factorio engine in headless mode to render map previews (`--generate-map-preview`) around spawn `(0, 0)`. Each process renders a whole batch of seeds using `--map-gen-seed-max`, amortizing engine startup across the batch.
-2. **Color Channel Analysis**: Identifies water and land tiles across the preview based on RGB channel signatures. (Blue-grey iron ore is explicitly excluded — its channel margins are nearly identical to shallow water's, so brightness is used to separate them.)
-3. **Spawn Landmass Labelling**: Runs `scipy.ndimage.label` over the land mask and selects the component containing the player's spawn point.
-4. **Perimeter Arc Calculation**: Scans the outer boundary of the preview area to calculate the contiguous circular arc of the border that does *not* connect to the starting landmass.
-5. **Categorization & Logging**:
+1. **Noise Prescan**: Long-lived headless Factorio servers evaluate terrain elevation at sparse points along 64 rays cast outward from spawn — no chunks generated, no image rendered. A ray that reaches the edge of the `--size` window on dry land proves spawn isn't enclosed, so the seed is discarded. Typically **over 99% of seeds stop here**. See [How Seeds Are Screened](#-how-seeds-are-screened-the-default).
+2. **Headless Generation of Survivors**: Only surviving candidates get a real map preview (`--generate-map-preview`) around spawn `(0, 0)`.
+3. **Color Channel Analysis**: Identifies water and land tiles across the preview based on RGB channel signatures. (Blue-grey iron ore is explicitly excluded — its channel margins are nearly identical to shallow water's, so brightness is used to separate them.)
+4. **Spawn Landmass Labelling**: Runs `scipy.ndimage.label` over the land mask and selects the component containing the player's spawn point.
+5. **Perimeter Arc Calculation**: Scans the outer boundary of the preview area to calculate the contiguous circular arc of the border that does *not* connect to the starting landmass.
+6. **Categorization & Logging**:
    - **`ISLAND` (100% Free Border)**: The spawn landmass is completely surrounded by water within the map preview bounds.
    - **`POSSIBLE ISLAND` (95.0% – 99.9% Free Border)**: Spawn landmass connects to the wider map only via a minuscule sliver / narrow isthmus.
    - **`PENINSULA` (50.0% – 94.9% Free Border)**: Spawn is protected on most sides by water, leaving a natural choke point for base defense.
    - Matching seed preview images and a log file (`found_seeds.txt`) are automatically saved to the output directory.
+
+> With **`--exhaustive`**, step 1 is skipped and step 2 renders *every* seed using batched generation (`--map-gen-seed-max`). Steps 3–6 are identical either way, so a reported match means the same thing in both modes.
 
 ---
 
@@ -105,13 +108,15 @@ uv run find_peninsula.py \
 | `--preset` | `str` | `default` | Map gen preset (`default`, `rail-world`, `death-world`, `rich-resources`, etc.). |
 | `--out-dir` | `str` | `./seed_previews` | Directory to save match preview images and logs. |
 | `--out-file` | `str` | `found_seeds.txt` | Text filename where found seeds are appended. |
-| `--batch-size` | `int` | *auto* | Seeds rendered per Factorio process. Auto-sized to give every worker a batch (bounded to 16–512). Larger values amortize engine startup further, but fewer batches than workers leaves cores idle. |
+| `--batch-size` | `int` | *auto* | **`--exhaustive` only.** Seeds rendered per Factorio process. Auto-sized to give every worker a batch (bounded to 16–512). Larger values amortize engine startup further, but fewer batches than workers leaves cores idle. |
 | `--temp-dir` | `str` | *system temp* | Scratch directory for previews being analyzed. Keep this off a bind mount — only matches are written to `--out-dir`. |
 | `--no-resume` | `flag` | `False` | Rescan batches already recorded in `scan_progress.txt` instead of skipping them. |
 | `--debug` | `flag` | `False` | Generate and save debug overlay images for all scanned seeds (saved seeds always generate debug images). |
 | `--map-gen-settings` | `str` | `None` | Path to a custom `map-gen-settings.json` file. |
 | `--map-settings` | `str` | `None` | Path to a custom `map-settings.json` file. |
 | `--factorio-bin` | `str` | `factorio` | Path to the Factorio executable. |
+
+Prescan-specific flags (`--exhaustive`, `--prescan-*`, `--keep-candidates`) are documented under [Prescan options](#prescan-options).
 
 ---
 
@@ -122,15 +127,18 @@ When a matching seed is discovered, both the clean map preview and the annotated
 ```
 seed_previews/
 ├── found_seeds.txt                         # Appended list of all discovered seeds and match types
-├── scan_progress.txt                       # Completed batch ranges, used to resume interrupted scans
+├── scan_progress.txt                       # Completed slice/batch ranges, used to resume interrupted scans
+├── island_candidates.txt                   # Every seed that survived the prescan, with its clear-ray count
+├── candidates/                             # Previews of candidates that did NOT match (only with --keep-candidates)
+│   └── CANDIDATE_seed_10101099.png
 ├── ISLAND_seed_10101035.png                # Clean Factorio map preview
 ├── DEBUG_seed_10101035.png                 # Visual overlay showing landmass & perimeter arc
-├── PENINSULA_seed_10101047_68pct.png       # 68% water perimeter peninsula
+├── PENINSULA_seed_10101047_68pct.png       # Peninsula with a 68% free border
 └── DEBUG_seed_10101047.png                 # Annotated overlay
 ```
 
 ### Visual Overlay Annotations:
-- **Green Tint**: The flood-filled connected spawn landmass.
+- **Green Tint**: The connected spawn landmass, as labelled by `scipy.ndimage.label`.
 - **Blue Markers**: The longest detected contiguous perimeter arc free of spawn land.
 - **Red Dot**: Spawn point origin `(0, 0)`.
 
@@ -149,7 +157,7 @@ seed_previews/
 
 Two consequences:
 
-- **Results are not comparable across sizes.** Seed `20271569 + 10` scores 67.5% (`PENINSULA`) at `--size 1024` but 100% (`ISLAND`) at `--size 2048`, because the wider window reveals that the landmass closes off. Pick a size that matches the base radius you care about and stay with it.
+- **Results are not comparable across sizes.** Seed `20271579` scores 67.5% (`PENINSULA`) at `--size 1024` but 100% (`ISLAND`) at `--size 2048`, because the wider window reveals that the landmass closes off. Pick a size that matches the base radius you care about and stay with it.
 - **Cost scales with area.** Measured generation floor on an 18-core host, 504 seeds, all workers busy:
 
 | `--size` | window | ms/seed | seeds/sec |
@@ -204,6 +212,7 @@ If you need every qualifying seed — a complete census rather than the best exa
 **Narrow isthmuses.** A landmass joined to the mainland by a thin neck — the classic "very nearly an island" — has a few rays threading that neck, so demanding *zero* clear rays rejects exactly the cases worth finding. `--prescan-max-clear` is a **work dial, not a quality dial**: over 50,000 seeds the median candidate ratio was flat across clear counts 0–3 (0.215, 0.209, 0.196, 0.182) while the ≥ 0.70 rate *rose* (0%, 0%, 0.4%, 0.47%), and the two best landmasses found — **0.846 and 0.757** — both sat at clear = 3. Loosening it renders more and finds proportionally more; it does not dilute quality.
 
 ### Prescan options
+<a name="prescan-options"></a>
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
